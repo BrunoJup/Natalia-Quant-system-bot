@@ -1,3 +1,9 @@
-flask==3.0.3
-requests==2.32.3
-gunicorn==21.2.0
+fastapi
+uvicorn
+python-telegram-bot==20.7
+aiohttp
+asyncpg
+numpy
+pandas
+scikit-learn
+joblib
