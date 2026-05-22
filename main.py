@@ -1,177 +1,228 @@
 import os
+import json
 import base64
-import requests
-from flask import Flask, request, jsonify, abort
-from concurrent.futures import ThreadPoolExecutor
+import logging
+import numpy as np
+import aiohttp
+import asyncpg
+import joblib
+import pandas as pd
 
-# ================= CONFIG =================
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-API_KEY = os.environ["OPENROUTER_API_KEY"]
+from sklearn.ensemble import GradientBoostingClassifier
+from fastapi import FastAPI, Request
+from telegram import Bot, Update
 
-TEXT_MODEL = os.getenv("OPENROUTER_MODEL", "mistralai/mistral-7b-instruct")
-VISION_MODELS = [
-    os.getenv("VISION_MODEL_1", "google/gemini-2.0-flash-001"),
-    os.getenv("VISION_MODEL_2", "anthropic/claude-3.5-haiku"),
-    os.getenv("VISION_MODEL_3", "meta-llama/llama-3.2-11b-vision-instruct"),
-]
-VISION_MODELS = [m for m in VISION_MODELS if m]
+# ================= CONFIG ================= #
 
-AGG_MODEL = os.getenv("AGGREGATOR_MODEL", TEXT_MODEL)
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+logging.basicConfig(level=logging.INFO)
 
-TG = f"https://api.telegram.org/bot{TOKEN}"
-OR = "https://openrouter.ai/api/v1/chat/completions"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-app = Flask(__name__)
+bot = Bot(token=TELEGRAM_TOKEN)
+app = FastAPI()
 
-# ================= ENGINE =================
-CONF = {1:52,2:58,3:64,4:71,5:78,6:84,7:89}
+# ================= DATABASE ================= #
 
-def avg(x): return sum(x)/len(x)
+class Database:
+    def __init__(self):
+        self.pool = None
 
-def evaluate(f):
-    a_for, a_against, b_for, b_against = f
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(DATABASE_URL)
 
-    total = avg(a_for)+avg(a_against)+avg(b_for)+avg(b_against)
-    ht = (avg(a_for)+avg(b_for))/2
+db = Database()
 
-    ft = 3 if total>=7.5 else 2 if total>=6.5 else 1 if total>=5.8 else 0
-    ht_s = 2 if ht>=3.2 else 1 if ht>=2.6 else 0
-    d = 1 if avg(a_against)>=2.5 and avg(b_against)>=2.5 else 0
+# ================= MEMORY (FOR MATCH PAIRING) ================= #
 
-    score = ft+ht_s+d
+last_prediction = {}
 
-    verdict = "🔥 VERY STRONG" if score>=6 else "✅ STRONG" if score>=4 else "🟡 LEAN" if score>=3 else "❌ NO BET"
+# ================= ML ENGINE ================= #
 
-    market = "—" if verdict=="❌ NO BET" else (
-        "Over 7.5" if score>=6 and total>=8 else
-        "Over 6.5" if score>=4 and total>=7 else
-        "Over 5.5" if score>=2 and total>=5.8 else
-        "HT Over 2.5" if ht>=2.6 else "No Market"
-    )
+class AutoML:
+    def __init__(self):
+        self.model = None
 
-    return verdict, market, CONF.get(score,45)
+    def load(self):
+        if os.path.exists("model.pkl"):
+            self.model = joblib.load("model.pkl")
 
-# ================= TELEGRAM =================
-def send(chat_id, text):
-    url = f"{TG}/sendMessage"
-    for i in range(0, len(text), 4096):
-        chunk = text[i:i+4096]
-        requests.post(url, json={
-            "chat_id": chat_id,
-            "text": chunk,
-            "parse_mode": "HTML"
-        }, timeout=10)
+    def train(self, df):
+        if len(df) < 10:
+            return
 
-def file_url(file_id):
-    r = requests.get(f"{TG}/getFile", params={"file_id": file_id}, timeout=10).json()
-    return f"https://api.telegram.org/file/bot{TOKEN}/{r['result']['file_path']}"
+        df = df.dropna()
 
-def img_b64(url):
-    r = requests.get(url, timeout=20)
-    return base64.b64encode(r.content).decode()
+        df["target"] = ((df["score1"] + df["score2"]) > 2.5).astype(int)
 
-# ================= AI =================
-def call(model, messages):
-    r = requests.post(
-        OR,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": model,
-            "messages": messages,
-            "temperature": 0.3,
-            "max_tokens": 900
-        },
-        timeout=40
-    )
-    return r.json()["choices"][0]["message"]["content"]
+        X = df[["score1", "score2"]]
+        y = df["target"]
 
-# ================= VISION =================
-def vision_pipeline(image):
-    def run(model):
-        return call(model, [{
+        model = GradientBoostingClassifier()
+        model.fit(X, y)
+
+        self.model = model
+        joblib.dump(model, "model.pkl")
+
+    def predict(self, x):
+        if not self.model:
+            return 0.5
+        return self.model.predict_proba(x)[0][1]
+
+ml = AutoML()
+
+# ================= VISION AI ================= #
+
+async def vision(image_bytes):
+    encoded = base64.b64encode(image_bytes).decode()
+
+    payload = {
+        "model": "google/gemini-2.0-flash-001",
+        "messages": [{
             "role": "user",
             "content": [
-                {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{image}"}},
-                {"type":"text","text":"Extract football fixtures and stats clearly"}
+                {"type": "text",
+                 "text": "Return JSON: team1,team2,p1,p2,score. If final result, only score."},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}}
             ]
-        }])
+        }]
+    }
 
-    with ThreadPoolExecutor(max_workers=len(VISION_MODELS)) as ex:
-        results = list(ex.map(run, VISION_MODELS))
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+            json=payload
+        ) as r:
+            res = await r.json()
 
-    combined = "\n\n".join(results)
+    raw = res["choices"][0]["message"]["content"]
+    return json.loads(raw.replace("```json","").replace("```",""))
 
-    return call(AGG_MODEL, [
-        {"role":"system","content":"You are a football betting analyst. Be structured and accurate."},
-        {"role":"user","content":combined}
-    ])
+# ================= SAVE ================= #
 
-# ================= ROUTES =================
-@app.route("/")
-def home():
-    return jsonify({"status":"ok"})
+async def save_match(match, pred=None, odds=None, status=None, img_type="prediction"):
+    async with db.pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO matches(
+                team1,team2,player1,player2,
+                predicted_market,predicted_prob,odds,
+                score1,score2,result_status,image_type
+            )
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        """,
+        match.get("team1"),
+        match.get("team2"),
+        match.get("p1"),
+        match.get("p2"),
+        pred.get("market") if pred else None,
+        pred.get("prob") if pred else None,
+        odds,
+        match.get("score1"),
+        match.get("score2"),
+        status,
+        img_type
+        )
 
-@app.route(f"/webhook/{TOKEN}", methods=["POST"])
-def webhook():
-    # Optional security
-    if WEBHOOK_SECRET:
-        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token","")
-        if token != WEBHOOK_SECRET:
-            abort(403)
+# ================= PROCESS PREDICTION ================= #
 
-    data = request.get_json(silent=True)
-    if not data:
-        return "bad request", 400
+async def process_prediction(chat_id, match):
 
-    msg = data.get("message", {})
-    chat = msg.get("chat", {}).get("id")
+    odds = 1.85
+    prob = 0.63  # placeholder (replace with ML later)
 
-    if not chat:
-        return "ok"
+    market = "Over 2.5" if prob > 0.5 else "Under 2.5"
 
-    # PHOTO
-    if "photo" in msg:
-        try:
-            url = file_url(msg["photo"][-1]["file_id"])
-            result = vision_pipeline(img_b64(url))
-            send(chat, result)
-        except Exception:
-            send(chat, "❌ Vision processing failed")
-        return "ok"
+    last_prediction[chat_id] = {
+        "match": match,
+        "market": market,
+        "prob": prob,
+        "odds": odds
+    }
 
-    text = msg.get("text","")
+    await save_match(match, {"market": market, "prob": prob}, odds, None, "prediction")
 
-    # ANALYZE
-    if text.startswith("/analyze"):
-        try:
-            _, raw = text.split(" ",1)
-            parts = raw.split("|")
-            f = [list(map(float,p.split(","))) for p in parts[1:]]
-            verdict, market, conf = evaluate(f)
-            send(chat, f"{verdict} | {market} | {conf}%")
-        except Exception:
-            send(chat, "Format: /analyze Match | 1,2 | 2,3 | 3,4 | 1,2")
+    msg = f"""
+🧠 PREDICTION GENERATED
+━━━━━━━━━━━━━━━━━━
+🏟 {match.get("team1")} vs {match.get("team2")}
+👤 {match.get("p1")} vs {match.get("p2")}
 
-    # AI
-    elif text.startswith("/ai"):
-        q = text.replace("/ai","",1).strip()
-        if not q:
-            send(chat, "Ask something after /ai")
+📊 Market: {market}
+📈 Probability: {round(prob*100,2)}%
+💸 Odds: {odds}
+━━━━━━━━━━━━━━━━━━
+"""
+
+    await bot.send_message(chat_id, msg)
+
+# ================= PROCESS RESULT ================= #
+
+async def process_result(chat_id, match):
+
+    score = match.get("score", "0-0")
+    s1, s2 = map(int, score.split("-"))
+
+    pred = last_prediction.get(chat_id)
+
+    if not pred:
+        await bot.send_message(chat_id, "⚠️ No previous prediction found")
+        return
+
+    actual = "Over 2.5" if (s1 + s2) > 2.5 else "Under 2.5"
+
+    status = "WIN" if actual == pred["market"] else "LOSS"
+
+    # save result
+    await save_match(match, None, None, status, "result")
+
+    msg = f"""
+📊 MATCH RESULT
+━━━━━━━━━━━━━━━━━━
+🏟 {match.get("team1","?")} vs {match.get("team2","?")}
+👤 {match.get("p1","?")} vs {match.get("p2","?")}
+
+📊 Score: {s1}-{s2}
+🎯 Actual: {actual}
+📡 Prediction: {pred["market"]}
+
+💰 RESULT: {status}
+━━━━━━━━━━━━━━━━━━
+"""
+
+    await bot.send_message(chat_id, msg)
+
+# ================= MAIN HANDLER ================= #
+
+@app.post("/webhook")
+async def webhook(req: Request):
+    data = await req.json()
+    update = Update.de_json(data, bot)
+
+    if update.message and update.message.photo:
+        photo = await update.message.photo[-1].get_file()
+        img = await photo.download_as_bytearray()
+
+        match = await vision(img)
+
+        # detect if result or prediction
+        if "score" in match and len(match.get("score","")) <= 3:
+            await process_result(update.message.chat_id, match)
         else:
-            try:
-                send(chat, call(TEXT_MODEL,[{"role":"user","content":q}]))
-            except Exception:
-                send(chat, "❌ AI request failed")
+            await process_prediction(update.message.chat_id, match)
 
-    else:
-        send(chat, "Send image or use /analyze or /ai")
+    return {"ok": True}
 
-    return "ok"
+# ================= START ================= #
 
-# ================= RUN =================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)))
+@app.on_event("startup")
+async def startup():
+    await db.connect()
+    ml.load()
+    logging.info("🚀 FULL CLOSED LOOP AI LIVE")
+
+@app.get("/")
+def home():
+    return {"status": "closed loop system running"}
